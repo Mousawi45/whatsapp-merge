@@ -207,6 +207,11 @@ def _decrypt_pass(src, size, head, key, with_md5, out, sha, label):
 
 def decrypt_file(src, key_text, dst=None, label=None):
     """Decrypt a .crypt15 to dst (or just hash it when dst is None). Returns the SHA-256 of the database."""
+    return _decrypt(src, key_text, dst, label)[0]
+
+
+def _decrypt(src, key_text, dst, label):
+    """Streams through the file, so it needs little memory. -> (SHA-256 of the database, has an MD5 trailer)"""
     from wakit import crypt
     size = os.path.getsize(src)
     with open(src, "rb") as f:
@@ -227,7 +232,7 @@ def decrypt_file(src, key_text, dst=None, label=None):
         if ok:
             if dst:
                 os.replace(dst + ".part", dst)
-            return sha.hexdigest()
+            return sha.hexdigest(), with_md5
         if out:
             os.remove(dst + ".part")
     raise WrongKey()
@@ -237,19 +242,18 @@ def encrypt_file(db_path, key_text, template_path, dst):
     """Encrypt db_path into a .crypt15 packed like template_path (same key), checked by decrypting it again."""
     from wakit import crypt
     Cipher, algorithms, modes = _cipher()
-    template = open(template_path, "rb").read()
-    head = crypt.parse(template)
+    # Read the original backup in pieces (never all at once: a large backup doesn't fit in a phone's memory)
+    with open(template_path, "rb") as f:
+        first = f.read(1 << 16)
+    head = crypt.parse(first)
     key = crypt.load_key(key_text, head["kind"])
-    try:
-        _, packing = crypt.decrypt(template, key, head)
-    except SystemExit:
-        raise WrongKey()
-    if packing["zip"]:
-        raise RuntimeError("unexpected ZIP-packed template")
+    _, with_md5 = _decrypt(template_path, key_text, None, "reading the original backup's layout")
+    packing = {"md5": with_md5, "zip": None}
+    if head["start"] > len(first) or head["iv_at"] + 16 > head["start"]:
+        raise RuntimeError("unexpected backup header")
     iv = secrets.token_bytes(16)
-    header = bytearray(template[:head["start"]])
+    header = bytearray(first[:head["start"]])
     header[head["iv_at"]:head["iv_at"] + 16] = iv
-    del template
     enc = Cipher(algorithms.AES(key), modes.GCM(iv)).encryptor()
     comp = zlib.compressobj()
     md5, sha = hashlib.md5(), hashlib.sha256()
@@ -701,15 +705,24 @@ def complete_search_index(cur, commit_every=None):
         if same < 0.9:
             log("  note: this phone's WhatsApp stores search text differently; filled-in entries use the plain text")
     lo, hi = cur.execute("SELECT coalesce(min(_id), 0), coalesce(max(_id), 0) FROM main.message").fetchone()
+    has_ts = "timestamp" in [r[1] for r in cur.execute("PRAGMA main.table_info(message)")]
+    months = {}
     added, step, last_log = 0, 50000, time.time()
     for a in range(lo, hi + 1, step):
         rows = cur.execute(
-            "SELECT m._id, m.chat_row_id, m.from_me, m.sender_jid_row_id, m.text_data FROM main.message m "
+            "SELECT m._id, m.chat_row_id, m.from_me, m.sender_jid_row_id, m.text_data, "
+            + ("m.timestamp" if has_ts else "0") + " FROM main.message m "
             "WHERE m._id >= ? AND m._id < ? AND m.text_data IS NOT NULL AND m.text_data != '' "
             "AND NOT EXISTS (SELECT 1 FROM main.message_ftsv2 f WHERE f.docid = m._id)", (a, a + step)).fetchall()
-        for mid, chat, from_me, sender, text in rows:
+        for mid, chat, from_me, sender, text, ts in rows:
             if chat_jid.get(chat) is None:
                 continue
+            if ts:
+                try:
+                    mon = time.strftime("%Y-%m", time.gmtime(ts / 1000))
+                    months[mon] = months.get(mon, 0) + 1
+                except (OverflowError, OSError, ValueError):
+                    pass
             s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
             cur.execute("INSERT INTO main.message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,'')",
                         (mid, text, f"{s} {W.b36(chat_jid[chat] + 10)}"))
@@ -719,6 +732,9 @@ def complete_search_index(cur, commit_every=None):
         if time.time() - last_log > 20:
             log(f"    search entries: {min(100, 100 * (a + step - lo) // max(1, hi - lo + 1))}% through, {added:,} added")
             last_log = time.time()
+    if months:
+        top = sorted(months.items(), key=lambda kv: -kv[1])[:6]
+        log("    filled in, by month: " + ", ".join(f"{m} {n:,}" for m, n in sorted(top)))
     log(f"    search entries: {added:,} added; checking the index (a few minutes, no output - normal)")
     try:
         cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('integrity-check')")

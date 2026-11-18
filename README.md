@@ -360,6 +360,7 @@ Use WhatsApp normally for 2–3 days first. WhatsApp makes its own backup each n
 
 ## Changes
 
+- **18 November 2026 (evening):** writing the new backup no longer loads the whole original backup into memory. With large backups (over about 0.5 GB) Android closed Termux right after "index checked" (the merge was affected too). `--fix-search` also shows which months the filled-in entries are from.
 - **18 November 2026 (later):** the search fix uses much less memory: it works in slices, shows progress every 20 seconds, saves as it goes, and rebuilds the index only if it's inconsistent. On some phones the earlier version froze and Android closed Termux during this step.
 - **18 November 2026:** the merge now completes and rebuilds WhatsApp's search index, so messages that were on the current phone before the merge can be found with search. Added `--fix-search` for phones merged with an earlier version.
 - **17 November 2026:** first version.
