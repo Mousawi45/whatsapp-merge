@@ -67,6 +67,7 @@ CUR_BACKUP = None                              # None: read it from WhatsApp's D
 WA_DATABASES = os.path.join(SHARED, "Android", "media", "com.whatsapp", "WhatsApp", "Databases")
 OUT_DIR = os.path.join(SHARED, "WA work")
 WORK = os.path.expanduser("~/wa")             # private to Termux: no other app can read the unlocked chats
+CHECK_FULL = False
 WAKIT_ONLY = False
 
 
@@ -1042,6 +1043,71 @@ def check_search(words):
                 if m2:
                     print(f"    (the message with sort id {d:,} has your words: message {m2[0]:,}, {when(m2[2])})")
 
+        print("\n== 2b. what search would show (newest first), depending on how WhatsApp links entries to messages ==")
+        clean = [re.sub(r'["*():^]', "", w) for w in words.split()]
+        pmatch = " ".join(f"{w}*" for w in clean if w)
+        total = one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ?", pmatch)[0]
+        print(f"  entries matching {pmatch!r}: {total:,}")
+        low = [w.lower() for w in clean if w]
+        for how, col in (("by message id", "_id"), ("by sort id", "sort_id")):
+            print(f"  if linked {how}:")
+            for mid, sid, chat, ts, mtype, text in q(
+                    f"SELECT _id, sort_id, chat_row_id, timestamp, message_type, text_data FROM message "
+                    f"WHERE {col} IN (SELECT docid FROM message_ftsv2 WHERE message_ftsv2 MATCH ?) "
+                    f"ORDER BY sort_id DESC LIMIT 6", pmatch):
+                has = all(w in (text or "").lower() for w in low)
+                print(f"    {when(ts)[:10]}  {label(chat)[:34]}, {TYPE_NAMES.get(mtype, f'type {mtype}')}, "
+                      f"has the words: {'yes' if has else 'NO'}")
+
+        print("\n== 2c. how WhatsApp writes the contact/chat tag (from its own recent entries) ==")
+        jm = {}
+        try:
+            for lid, pn in q("SELECT lid_row_id, jid_row_id FROM jid_map"):
+                jm[lid], jm[pn] = pn, lid
+        except sqlite3.Error:
+            pass
+        chats = {r[0]: r[1] for r in q("SELECT _id, jid_row_id FROM chat")}
+        for group, sql in (("newest entries", "SELECT docid, c1fts_jid FROM message_ftsv2_content ORDER BY docid DESC LIMIT 300"),
+                           ("entries made on this phone before the merge",
+                            "SELECT docid, c1fts_jid FROM message_ftsv2_content WHERE docid < ? ORDER BY docid DESC LIMIT 300")):
+            try:
+                rows = q(sql) if "?" not in sql else q(sql, one("SELECT max(_id) FROM message WHERE _id < sort_id")[0] + 1)
+            except (sqlite3.Error, TypeError):
+                rows = []
+            tally, n = {}, 0
+            for docid, tag in rows:
+                m = one("SELECT from_me, sender_jid_row_id, chat_row_id FROM message WHERE _id = ?", docid)
+                if not m or not tag:
+                    continue
+                n += 1
+                from_me, sender, chat = m
+                cj = chats.get(chat)
+                parts = str(tag).split()
+                tally[f"{len(parts)} part(s)"] = tally.get(f"{len(parts)} part(s)", 0) + 1
+                cands = [("sender", sender), ("sender's other id", jm.get(sender)), ("chat", cj),
+                         ("chat's other id", jm.get(cj)), ("chat row", chat)]
+                for i, tok in enumerate(parts[:2]):
+                    try:
+                        v = int(tok, 36)
+                    except ValueError:
+                        continue
+                    if i == 0 and from_me:
+                        k = f"part 1 when sent by you = {tok!r}" if tok in ("0", "1") else "part 1 when sent by you: other"
+                        tally[k] = tally.get(k, 0) + 1
+                        continue
+                    for name, val in cands:
+                        if val is not None and val > 0:
+                            for off in (10, 0):
+                                if v == val + off:
+                                    k = f"part {i + 1} = {name} + {off}"
+                                    tally[k] = tally.get(k, 0) + 1
+            print(f"  {group} ({n} checked):")
+            for k, v in sorted(tally.items(), key=lambda kv: -kv[1])[:8]:
+                print(f"    {v:>4}  {k}")
+
+        if not CHECK_FULL:
+            print("\nDone. Nothing was changed. Send a screenshot of everything above.")
+            return
         print("\n== 3. by month: text messages / no entry / of 25 entries checked: same text, similar, UNRELATED ==")
         rnd = random.Random(1)
         stats, samples = {}, {}
@@ -1130,7 +1196,7 @@ def check_search(words):
 
 
 def parse_args(argv):
-    global OLD_BACKUP, CUR_BACKUP, OUT_DIR, WAKIT_ONLY
+    global OLD_BACKUP, CUR_BACKUP, OUT_DIR, WAKIT_ONLY, CHECK_FULL
     p = argparse.ArgumentParser(description="Merge an old phone's WhatsApp backup into the current phone's backup.")
     p.add_argument("--old", help="the old phone's msgstore.db.crypt15")
     p.add_argument("--current", help="the current phone's msgstore.db.crypt15")
@@ -1140,6 +1206,7 @@ def parse_args(argv):
     p.add_argument("--wakit-only", action="store_true", help="copy only what wakit 0.3.0 copies")
     p.add_argument("--fix-search", action="store_true",
                    help="no merge: make every message in the current backup findable by WhatsApp search")
+    p.add_argument("--full", action="store_true", help="with --check-search: also check every month")
     p.add_argument("--check-search", nargs="?", const="", metavar="WORDS",
                    help="no changes: show why WhatsApp search can't find some words (prints no message text)")
     a = p.parse_args(argv)
@@ -1152,6 +1219,7 @@ def parse_args(argv):
     if a.work:
         set_work(os.path.abspath(os.path.expanduser(a.work)))
     WAKIT_ONLY = a.wakit_only
+    CHECK_FULL = a.full
     return a
 
 
