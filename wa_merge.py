@@ -927,6 +927,192 @@ Next: follow the "Restore on Android" steps in the guide (skip the old-media ste
         subprocess.run(["termux-wake-unlock"], check=False)
 
 
+TYPE_NAMES = {0: "text", 1: "photo", 2: "voice/audio", 3: "video", 4: "contact", 5: "location", 7: "system",
+              9: "document", 13: "GIF", 15: "deleted", 20: "sticker", 42: "view-once photo", 43: "view-once video"}
+
+
+def check_search(words):
+    """--check-search: read-only look at why WhatsApp search can't find some words. Prints no message text."""
+    import difflib
+    import random
+    import unicodedata
+    checks(need_old=False)
+    src, _ = find_current_backup()
+    if not words:
+        print("\nPaste a few words from a message that search can't find (long-press it in WhatsApp > Copy),")
+        words = input("then press Enter: ").strip()
+    if not words:
+        stop("no words given")
+    db = os.path.join(WORK, "check.db")
+    for f in (db, db + "-journal", db + "-wal"):
+        if os.path.exists(f):
+            os.remove(f)
+    if free_bytes(WORK) < 3.5 * os.path.getsize(src) + 1e9:
+        stop("not enough free space")
+    while True:
+        key = ask_key("CURRENT phone's 64-digit key")
+        try:
+            decrypt_file(src, key, db, "decrypting the backup")
+            break
+        except WrongKey:
+            print("  That key doesn't open this backup. Check you're using this phone's key.")
+    del key
+    c = sqlite3.connect(db)   # a throwaway copy (deleted at the end); writable only because the index check needs it
+    c.execute("PRAGMA cache_size=-65536")
+    q = lambda sql, *a: c.execute(sql, a).fetchall()
+    one = lambda sql, *a: c.execute(sql, a).fetchone()
+    try:
+        print("\n== 1. search tables ==")
+        for name, sql in q("SELECT name, sql FROM sqlite_master WHERE sql LIKE '%VIRTUAL%'"):
+            sql = re.sub(r"\s+", " ", sql)
+            print(f"  {name}: {sql[:110]}")
+        for t in ("content", "segments", "segdir", "docsize", "stat"):
+            try:
+                print(f"  message_ftsv2_{t}: {one(f'SELECT count(*) FROM message_ftsv2_{t}')[0]:,} rows")
+            except sqlite3.Error:
+                print(f"  message_ftsv2_{t}: (none)")
+        try:
+            for k, v in q("SELECT key, value FROM props WHERE key LIKE '%fts%' OR key LIKE '%search%' "
+                          "OR key LIKE '%index%' ORDER BY key"):
+                print(f"  setting {k} = {str(v)[:30]}")
+        except sqlite3.Error:
+            pass
+        t0 = time.time()
+        try:
+            c.execute("INSERT INTO message_ftsv2(message_ftsv2) VALUES('integrity-check')")
+            res = "ok"
+        except sqlite3.Error as e:
+            res = f"FAILED ({e})"
+        print(f"  index check: {res} ({time.time() - t0:.0f}s)")
+        lo, hi = one("SELECT coalesce(min(_id), 0), coalesce(max(_id), 0) FROM message")
+        slo, shi = one("SELECT coalesce(min(sort_id), 0), coalesce(max(sort_id), 0) FROM message")
+        print(f"  message ids {lo:,}-{hi:,}, sort ids {slo:,}-{shi:,}")
+        try:
+            bad = one("SELECT count(*), sum(m._id IS NULL) FROM message_ftsv2_content f LEFT JOIN message m ON m._id = f.docid "
+                      "WHERE m._id IS NULL OR coalesce(m.text_data, '') = ''")
+            print(f"  entries pointing at a message with no text: {bad[0]:,} (at no message at all: {bad[1] or 0:,})")
+        except sqlite3.Error:
+            pass
+
+        def label(chat):
+            r = one("SELECT c.subject, j.user, j.server FROM chat c JOIN jid j ON j._id = c.jid_row_id WHERE c._id = ?", chat)
+            if not r:
+                return f"chat #{chat} (missing)"
+            return f'group "{r[0]}"' if r[0] else f"1:1 ...{str(r[1])[-4:]}@{r[2]}"
+
+        def when(ts):
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts / 1000)) if ts else "?"
+
+        def expected_jid(chat, from_me, sender):
+            from wakit import db_merge as W
+            cj = one("SELECT jid_row_id FROM chat WHERE _id = ?", chat)
+            if not cj:
+                return None
+            s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
+            return f"{s} {W.b36(cj[0] + 10)}"
+
+        print("\n== 2. your words ==")
+        hits = q("SELECT _id, sort_id, chat_row_id, timestamp, message_type, from_me, sender_jid_row_id, text_data "
+                 "FROM message WHERE instr(text_data, ?) > 0 ORDER BY _id LIMIT 8", words)
+        print(f"  messages containing them: {len(hits)}{' (first 8)' if len(hits) == 8 else ''}")
+        tokens = [w.replace('"', "") for w in words.split() if w.replace('"', "")]
+        match = " ".join(f'"{w}"' for w in tokens)
+        for mid, sid, chat, ts, mtype, from_me, sender, text in hits:
+            e = one("SELECT content, fts_jid, fts_namespace FROM message_ftsv2 WHERE docid = ?", mid)
+            print(f"  message {mid:,} (sort {sid:,}), {when(ts)}, {label(chat)}, {'sent' if from_me else 'received'}")
+            if not e:
+                print("    search entry: NONE")
+                continue
+            found = one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ? AND docid = ?", match, mid)[0]
+            print(f"    search entry: yes; same text: {'yes' if e[0] == text else 'no'}; "
+                  f"contact/chat tag ok: {'yes' if e[1] == expected_jid(chat, from_me, sender) else 'NO'} "
+                  f"({re.sub(r'[0-9a-z]', 'x', str(e[1]))}); namespace {e[2]!r}; found by search: {'yes' if found else 'NO'}")
+        docs = [r[0] for r in q("SELECT docid FROM message_ftsv2 WHERE message_ftsv2 MATCH ? LIMIT 8", match)]
+        print(f"  the search index finds: {len(docs)} entr{'y' if len(docs) == 1 else 'ies'}")
+        for d in docs:
+            m = one("SELECT _id, chat_row_id, timestamp, message_type, text_data FROM message WHERE _id = ?", d)
+            if not m:
+                print(f"  entry {d:,} -> NO message with that id")
+                continue
+            ok = words in (m[4] or "")
+            print(f"  entry {d:,} -> {when(m[2])}, {label(m[1])}, {TYPE_NAMES.get(m[3], f'type {m[3]}')}, "
+                  f"has your words: {'yes' if ok else 'NO'}")
+            if not ok:
+                m2 = one("SELECT _id, chat_row_id, timestamp FROM message WHERE sort_id = ? AND instr(text_data, ?) > 0", d, words)
+                if m2:
+                    print(f"    (the message with sort id {d:,} has your words: message {m2[0]:,}, {when(m2[2])})")
+
+        print("\n== 3. by month: messages with text / without an entry / of 25 checked: same text, found by search ==")
+        rnd = random.Random(1)
+        stats, samples = {}, {}
+        step = 50000
+        for a in range(lo, hi + 1, step):
+            for mid, ts, has in q("SELECT m._id, m.timestamp, EXISTS(SELECT 1 FROM message_ftsv2 f WHERE f.docid = m._id) "
+                                  "FROM message m WHERE m._id >= ? AND m._id < ? AND coalesce(m.text_data, '') != ''",
+                                  a, a + step):
+                mon = time.strftime("%Y-%m", time.localtime(ts / 1000)) if ts and ts > 0 else "no date"
+                st = stats.setdefault(mon, [0, 0])
+                st[0] += 1
+                st[1] += not has
+                if has:
+                    sm = samples.setdefault(mon, [])
+                    k = st[0] - st[1]
+                    if len(sm) < 25:
+                        sm.append(mid)
+                    elif rnd.random() < 25 / k:
+                        sm[rnd.randrange(25)] = mid
+        diffs = {}
+        shown = fine = 0
+        for mon in sorted(stats):
+            n, missing = stats[mon]
+            same = searchable = 0
+            for mid in samples.get(mon, []):
+                text, content = one("SELECT m.text_data, f.content FROM message m JOIN message_ftsv2 f ON f.docid = m._id "
+                                    "WHERE m._id = ?", mid)
+                same += text == content
+                if text != content and len(diffs) < 3000:
+                    diffs[mid] = (text, content)
+                toks = sorted((t.replace('"', "") for t in re.split(r"[\s\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]+", content or "")),
+                              key=len)
+                if toks and toks[-1]:
+                    searchable += bool(one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ? AND docid = ?",
+                                           f'"{toks[-1]}"', mid)[0])
+                else:
+                    searchable += 1
+            k = len(samples.get(mon, []))
+            if missing > max(2, n // 100) or searchable < k:
+                print(f"  {mon}: {n:>8,} / {missing:>7,} / same {same}/{k}, found {searchable}/{k}")
+                shown += 1
+            else:
+                fine += 1
+        print(f"  ({fine} months fine and not shown)")
+
+        print("\n== 4. how the entries' text differs from the messages (character changes, most common first) ==")
+        changes = {}
+        for text, content in list(diffs.values())[:1500]:
+            sm = difflib.SequenceMatcher(None, text or "", content or "", autojunk=False)
+            for op, a1, a2, b1, b2 in sm.get_opcodes():
+                if op == "equal":
+                    continue
+                key = (text[a1:a2][:3], (content or "")[b1:b2][:3])
+                changes[key] = changes.get(key, 0) + 1
+
+        def show(x):
+            if not x:
+                return "(nothing)"
+            return " ".join(f"U+{ord(ch):04X}" + (f"({ch})" if unicodedata.category(ch)[0] in "LN" else "") for ch in x)
+        for (a, b), n in sorted(changes.items(), key=lambda kv: -kv[1])[:12]:
+            print(f"  {n:>5}x  {show(a)}  ->  {show(b)}")
+        print("\nDone. Nothing was changed. Send a screenshot of everything above.")
+    finally:
+        c.close()
+        for f in (db, db + "-journal", db + "-wal"):
+            if os.path.exists(f):
+                os.remove(f)
+        if shutil.which("termux-wake-unlock"):
+            subprocess.run(["termux-wake-unlock"], check=False)
+
+
 def parse_args(argv):
     global OLD_BACKUP, CUR_BACKUP, OUT_DIR, WAKIT_ONLY
     p = argparse.ArgumentParser(description="Merge an old phone's WhatsApp backup into the current phone's backup.")
@@ -938,6 +1124,8 @@ def parse_args(argv):
     p.add_argument("--wakit-only", action="store_true", help="copy only what wakit 0.3.0 copies")
     p.add_argument("--fix-search", action="store_true",
                    help="no merge: make every message in the current backup findable by WhatsApp search")
+    p.add_argument("--check-search", nargs="?", const="", metavar="WORDS",
+                   help="no changes: show why WhatsApp search can't find some words (prints no message text)")
     a = p.parse_args(argv)
     if a.old:
         OLD_BACKUP = os.path.abspath(os.path.expanduser(a.old))
@@ -953,6 +1141,9 @@ def parse_args(argv):
 
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    if a.check_search is not None:
+        print("wa_merge --check-search: why can't WhatsApp search find a message? (changes nothing)\n")
+        return check_search(a.check_search)
     if a.fix_search:
         print("wa_merge --fix-search: make every message findable by WhatsApp search\n")
         return fix_search()
