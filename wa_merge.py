@@ -1035,14 +1035,14 @@ def check_search(words):
                 print(f"  entry {d:,} -> NO message with that id")
                 continue
             ok = words in (m[4] or "")
-            print(f"  entry {d:,} -> {when(m[2])}, {label(m[1])}, {TYPE_NAMES.get(m[3], f'type {m[3]}')}, "
+            print(f"  entry {d:,} -> message {m[0]:,}: {when(m[2])}, {label(m[1])}, {TYPE_NAMES.get(m[3], f'type {m[3]}')}, "
                   f"has your words: {'yes' if ok else 'NO'}")
             if not ok:
                 m2 = one("SELECT _id, chat_row_id, timestamp FROM message WHERE sort_id = ? AND instr(text_data, ?) > 0", d, words)
                 if m2:
                     print(f"    (the message with sort id {d:,} has your words: message {m2[0]:,}, {when(m2[2])})")
 
-        print("\n== 3. by month: messages with text / without an entry / of 25 checked: same text, found by search ==")
+        print("\n== 3. by month: text messages / no entry / of 25 entries checked: same text, similar, UNRELATED ==")
         rnd = random.Random(1)
         stats, samples = {}, {}
         step = 50000
@@ -1061,35 +1061,51 @@ def check_search(words):
                         sm.append(mid)
                     elif rnd.random() < 25 / k:
                         sm[rnd.randrange(25)] = mid
-        diffs = {}
-        shown = fine = 0
+        similar_pairs, unrelated = [], []
+        fine = 0
         for mon in sorted(stats):
             n, missing = stats[mon]
-            same = searchable = 0
+            same = sim = unrel = 0
             for mid in samples.get(mon, []):
                 text, content = one("SELECT m.text_data, f.content FROM message m JOIN message_ftsv2 f ON f.docid = m._id "
                                     "WHERE m._id = ?", mid)
-                same += text == content
-                if text != content and len(diffs) < 3000:
-                    diffs[mid] = (text, content)
-                toks = sorted((t.replace('"', "") for t in re.split(r"[\s\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]+", content or "")),
-                              key=len)
-                if toks and toks[-1]:
-                    searchable += bool(one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ? AND docid = ?",
-                                           f'"{toks[-1]}"', mid)[0])
+                text, content = text or "", content or ""
+                if text == content:
+                    same += 1
+                elif difflib.SequenceMatcher(None, text.lower()[:300], content.lower()[:300], autojunk=False).ratio() >= 0.6:
+                    sim += 1
+                    if len(similar_pairs) < 1500:
+                        similar_pairs.append((text, content))
                 else:
-                    searchable += 1
-            k = len(samples.get(mon, []))
-            if missing > max(2, n // 100) or searchable < k:
-                print(f"  {mon}: {n:>8,} / {missing:>7,} / same {same}/{k}, found {searchable}/{k}")
-                shown += 1
+                    unrel += 1
+                    if len(unrelated) < 3 and content.strip():
+                        unrelated.append((mid, content))
+            if missing > max(2, n // 100) or unrel:
+                print(f"  {mon}: {n:>8,} / {missing:>6,} / {same} same, {sim} similar, {unrel} UNRELATED")
             else:
                 fine += 1
         print(f"  ({fine} months fine and not shown)")
+        if unrelated:
+            print("  where the text of some unrelated entries really belongs (one pass over all messages):")
+            want = {content: mid for mid, content in unrelated}
+            owners = {}
+            for a in range(lo, hi + 1, step):
+                for oid, osort, text in q("SELECT _id, sort_id, text_data FROM message WHERE _id >= ? AND _id < ? "
+                                          "AND coalesce(text_data, '') != ''", a, a + step):
+                    if text in want and text not in owners:
+                        owners[text] = (oid, osort)
+            for content, mid in want.items():
+                m = one("SELECT sort_id FROM message WHERE _id = ?", mid)
+                if content in owners:
+                    oid, osort = owners[content]
+                    print(f"    entry {mid:,} (sort {m[0]:,}) has the text of message {oid:,} (sort {osort:,}): "
+                          f"id difference {oid - mid:+,}")
+                else:
+                    print(f"    entry {mid:,} (sort {m[0]:,}): no message has exactly its text")
 
         print("\n== 4. how the entries' text differs from the messages (character changes, most common first) ==")
         changes = {}
-        for text, content in list(diffs.values())[:1500]:
+        for text, content in similar_pairs:
             sm = difflib.SequenceMatcher(None, text or "", content or "", autojunk=False)
             for op, a1, a2, b1, b2 in sm.get_opcodes():
                 if op == "equal":
