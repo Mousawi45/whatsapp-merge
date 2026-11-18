@@ -1,6 +1,6 @@
 # Merge your old WhatsApp chats into your current phone (free, no data loss)
 
-*Last updated 17 November 2026*
+*Last updated 18 November 2026*
 
 You can merge an old phone's WhatsApp history into the WhatsApp on your current phone and keep both, for free, using your own devices and the official WhatsApp app. This guide shows how, step by step. The tool, [`wa_merge.py`](wa_merge.py), is in this repository.
 
@@ -28,6 +28,7 @@ WhatsApp has no merge button. Restoring a Google backup, "Transfer chats" betwee
 - [Method D: old Android to current iPhone](#method-d-old-android-to-current-iphone)
 - [Restore on Android (Methods A, B and C)](#restore-on-android-methods-a-b-and-c)
 - [Troubleshooting and FAQ](#troubleshooting-and-faq)
+- [Fix search after an earlier merge](#fix-search-after-an-earlier-merge)
 - [Cleanup afterwards](#cleanup-afterwards)
 - [Credits, licence and disclaimer](#credits-licence-and-disclaimer)
 
@@ -100,6 +101,7 @@ This runs entirely on your current phone, in a free app called Termux, with the 
 - It decrypts and encrypts in small pieces, so it uses about 2.5 GB of memory for 4 million messages, against over 5 GB for wakit on a computer.
 - It shows progress the whole time.
 - It also copies details wakit 0.3.0 leaves out: contact cards, shared locations, call bubbles, read info, group invites and more.
+- It completes and rebuilds WhatsApp's search index, so messages from both phones can be found with search.
 - It never changes your original backup files, checks everything before and after, and can pick up where it stopped.
 
 **Set up Termux (once, with internet)**
@@ -292,6 +294,7 @@ No Termux? Copy the phone's **WA work/WhatsApp/Media** folder to a computer, dro
 | WhatsApp offers a **Google** backup instead of the local one | Don't restore it. Uninstall WhatsApp again (move the WhatsApp folder out first), then retry. Other users report that removing the Google account from the phone during the restore, or deleting WhatsApp's Drive backup, makes WhatsApp use the local file. Only do that once your local copies are safe. |
 | Restore paused at some % | Make sure the phone is online and leave WhatsApp on screen. If Android says WhatsApp isn't responding, tap **Wait**. |
 | Some chats show a number, not a name | Unsaved numbers always show as numbers. For saved contacts, give the contact sync a few minutes, or tap the new-chat button → ⋮ → **Refresh**. |
+| Search doesn't find messages that were on the current phone before the merge | Fixed in the 18 November 2026 version of wa_merge.py. If you merged with an earlier version (or with wakit), see [Fix search after an earlier merge](#fix-search-after-an-earlier-merge). |
 | A "not copied" list in the report | Normal. These are minor details (channels, payments, AI features) whose links the tool can't safely map, plus timers, reminders and unsent items left out on purpose. |
 
 **Will I lose messages sent to me during the process?** No, if the phone stays offline from the final backup until the reinstall. They wait on WhatsApp's servers and arrive after the restore.
@@ -301,6 +304,32 @@ No Termux? Copy the phone's **WA work/WhatsApp/Media** folder to a computer, dro
 **Does this work for WhatsApp Business?** It hasn't been tested. Business uses a different app folder (`com.whatsapp.w4b`).
 
 **Is it safe for my account?** It only uses the official WhatsApp app and your own backup files; no modified WhatsApp is involved. It is still unofficial, so use it at your own risk.
+
+## Fix search after an earlier merge
+
+Merges made with wa_merge.py before 18 November 2026, or with wakit 0.3.0, can leave messages that were on the current phone before the merge out of WhatsApp's search. They're still in your chats; search just can't find them. Messages from the old phone and messages received after the restore are found normally.
+
+Why: WhatsApp backups leave out most of the search index, and WhatsApp rebuilds it after a restore. Adding the old phone's search entries made WhatsApp think the index was already complete, so it never rebuilt the entries for the current phone's own messages. The current version of wa_merge.py fills in every missing entry and rebuilds the index during the merge.
+
+To fix a phone that's already merged (about 1 hour, no merging again):
+
+1. In Termux, get the current version of the script:
+
+```
+pkg install -y python python-cryptography curl
+pip install wakit==0.3.0
+curl -LO https://raw.githubusercontent.com/Mousawi45/whatsapp-merge/main/wa_merge.py
+```
+
+2. Follow the offline rules: log out of linked devices, turn on airplane mode, then WhatsApp → Settings → Chats → Chat backup → **Back up**. Close WhatsApp.
+3. Run:
+
+```
+python wa_merge.py --fix-search
+```
+
+   Type **yes** when it asks whether the backup is fresh, and paste **this phone's** key. It only adds the missing search entries and rebuilds the index; nothing else in the backup changes. The result is **WA work/msgstore.db.crypt15**, with **current-original.crypt15** as your undo.
+4. Follow [Restore on Android](#restore-on-android-methods-a-b-and-c), but **skip step 3** (the media is already in place).
 
 ## Cleanup afterwards
 
@@ -328,3 +357,8 @@ Use WhatsApp normally for 2–3 days first. WhatsApp makes its own backup each n
 - [wakit on GitHub](https://github.com/menaxmaged/wakit) (README: workflows 1–5, commands and warnings) and [on PyPI](https://pypi.org/project/wakit/)
 - [Termux app](https://github.com/termux/termux-app) and [Termux on F-Droid](https://f-droid.org/packages/com.termux/)
 - [wa-crypt-tools](https://github.com/ElDavoo/wa-crypt-tools), another open-source tool for WhatsApp backup files
+
+## Changes
+
+- **18 November 2026:** the merge now completes and rebuilds WhatsApp's search index, so messages that were on the current phone before the merge can be found with search. Added `--fix-search` for phones merged with an earlier version.
+- **17 November 2026:** first version.

@@ -18,6 +18,7 @@ decryption details and its merge logic is adapted here, with these changes:
   * also copies message details wakit 0.3.0 leaves out (contact cards, locations, call bubbles,
     read info, group invites, ...), each table only when every link in it is understood, and
     each checked on its own; disappearing-message timers, reminders and unsent work are left out
+  * completes and rebuilds WhatsApp's search index, so every message can be found by search
 
 Not affiliated with WhatsApp or Meta. Unofficial: keep untouched copies of your backups.
 
@@ -33,6 +34,8 @@ Options:         --old FILE       the old phone's msgstore.db.crypt15
                  --work DIR       where the unlocked copies are kept (default: ~/wa, private to Termux)
                  --redo-merge     merge again from a new current-phone backup (keeps the unlocked old one)
                  --wakit-only     copy only what wakit 0.3.0 copies (skip the extra details)
+                 --fix-search     no merge: rebuild the search index of the current backup (for merges
+                                  made before this was fixed, where older messages weren't searchable)
 Keys are typed in when asked; they are never saved or printed.
 
 MIT License
@@ -628,6 +631,10 @@ def merge(cur, report):
             if fts % 200000 == 0:
                 log(f"  search index: {fts:,}")
     report["rows"]["message_ftsv2"] = fts
+    log("  completing the search index (a few minutes, no output - normal)")
+    added = complete_search_index(cur)
+    if added:
+        report["rows"]["search entries filled in"] = added
 
     n = copy_rows(cur, "call_log", {"_id": "L*", "jid_row_id": "J", "group_jid_row_id": "J",
                                      "call_creator_device_jid_row_id": "R"}, maps, jids, or_ignore=True)
@@ -671,6 +678,49 @@ def merge(cur, report):
                   unhidden=sum(1 for c in hidden_new if c in touched), messages=n_inserted, dupes=dupes,
                   jids_added=jids.added, jid_map_added=jm, names_added=names, pn_to_lid=len(jids.mapped),
                   first_ts=first_ts, last_ts=last_ts)
+
+
+def complete_search_index(cur):
+    """Make WhatsApp's search index cover every text message, and rebuild it.
+
+    Backups keep the search index's text but not its lookup tables. Adding entries to such a half-empty
+    index made WhatsApp skip its own rebuild after the restore, so messages that were already on the
+    current phone could not be found by search. This adds any missing entries (in the format wakit uses)
+    and rebuilds the whole index from its text."""
+    from wakit import db_merge as W
+    from wakit.export_import import has_fts
+    if not has_fts(cur):
+        return 0
+    chat_jid = dict(cur.execute("SELECT _id, jid_row_id FROM main.chat"))
+    sample = cur.execute("SELECT f.content, m.text_data FROM main.message_ftsv2 f JOIN main.message m ON m._id = f.docid "
+                         "WHERE m.text_data != '' LIMIT 2000").fetchall()
+    if sample:
+        same = sum(a == b for a, b in sample) / len(sample)
+        log(f"  WhatsApp's own search entries match the message text exactly: {same:.0%} of {len(sample):,} checked")
+        if same < 0.9:
+            log("  note: this phone's WhatsApp stores search text differently; filled-in entries use the plain text")
+    missing = [r[0] for r in cur.execute(
+        "SELECT m._id FROM main.message m WHERE m.text_data IS NOT NULL AND m.text_data != '' "
+        "AND NOT EXISTS (SELECT 1 FROM main.message_ftsv2 f WHERE f.docid = m._id)")]
+    added = 0
+    for i in range(0, len(missing), 5000):
+        batch = missing[i:i + 5000]
+        rows = cur.execute(f"SELECT _id, chat_row_id, from_me, sender_jid_row_id, text_data FROM main.message "
+                           f"WHERE _id IN ({','.join('?' * len(batch))})", batch).fetchall()
+        for mid, chat, from_me, sender, text in rows:
+            if chat not in chat_jid or chat_jid[chat] is None:
+                continue
+            s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
+            cur.execute("INSERT INTO main.message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,'')",
+                        (mid, text, f"{s} {W.b36(chat_jid[chat] + 10)}"))
+            added += 1
+    cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('rebuild')")
+    try:
+        cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('integrity-check')")
+    except sqlite3.OperationalError as e:
+        if "integrity-check" not in str(e):   # older SQLite without the command: skip the extra check
+            raise
+    return added
 
 
 def run_merge(old_path, new_path):
@@ -724,8 +774,9 @@ def print_report(r):
 
 # --------------------------------------------------------------------------------------------- the guided run
 
-def checks():
-    print("wa_merge - merge your old WhatsApp history into your current phone's backup\n")
+def checks(need_old=True):
+    if need_old:
+        print("wa_merge - merge your old WhatsApp history into your current phone's backup\n")
     try:
         import cryptography  # noqa: F401
     except ImportError:
@@ -745,14 +796,14 @@ def checks():
     uses_shared = any(p.startswith(SHARED) for p in (OLD_BACKUP, OUT_DIR, CUR_BACKUP or WA_DATABASES))
     if uses_shared and not os.access(SHARED, os.R_OK):
         stop("no access to the phone's storage. Run:  termux-setup-storage   and tap Allow, then try again")
-    if not os.path.exists(OLD_READY) and not os.path.isfile(OLD_BACKUP):
+    if need_old and not os.path.exists(OLD_READY) and not os.path.isfile(OLD_BACKUP):
         stop(f"can't find the old phone's backup at:\n  {OLD_BACKUP}\n"
              "Put it there, or give its location with  --old \"<path to msgstore.db.crypt15>\"")
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
     free = free_bytes(WORK)
     log(f"free space: {gb(free)}" + (f", free memory: {gb(mem_available())}" if mem_available() else ""))
-    if not os.path.exists(OLD_READY):
+    if need_old and not os.path.exists(OLD_READY):
         need = 4.5 * os.path.getsize(OLD_BACKUP) + 2e9
         if free < need:
             stop(f"not enough free space: {gb(free)} free, about {gb(need)} needed. Free some space and run again.")
@@ -779,6 +830,73 @@ def find_current_backup():
          "or give its location with  --current \"<path>\"")
 
 
+def fix_search():
+    """--fix-search: no merge; make every message in the current backup findable by WhatsApp search."""
+    checks(need_old=False)
+    src, original = find_current_backup()
+    mtime = os.path.getmtime(src)
+    print(f"\nThe current phone's backup: made {time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))} "
+          f"({(time.time() - mtime) / 60:.0f} minutes ago), {gb(os.path.getsize(src))}")
+    print("Anything sent or received AFTER that backup will not be in the fixed backup. Make a fresh backup in")
+    print("airplane mode (Wi-Fi off) and keep the phone offline until the restore is done.")
+    if not ask_yes("Is this backup fresh and is the phone offline?"):
+        stop("turn on airplane mode, make a fresh backup (WhatsApp > Settings > Chats > Chat backup > Back up), "
+             "and run this again")
+    if free_bytes(WORK) < 3.5 * os.path.getsize(src) + 2e9:
+        stop("not enough free space for this backup")
+    shutil.copy2(src, original + ".part")
+    os.replace(original + ".part", original)
+    log(f"kept an untouched copy of the current phone's backup: {original}")
+    db = os.path.join(WORK, "fix.db")
+    for f in (db, db + "-journal", db + "-wal"):
+        if os.path.exists(f):
+            os.remove(f)
+    while True:
+        key = ask_key("CURRENT phone's 64-digit key")
+        try:
+            decrypt_file(original, key, db, "decrypting the backup")
+            break
+        except WrongKey:
+            print("  That key doesn't open this backup. Check you're using this phone's key.")
+    from wakit import doctor
+    c = sqlite3.connect(db)
+    doctor.require(c, "android", "the backup")
+    c.close()
+    con = sqlite3.connect(db, isolation_level=None)
+    cur = con.cursor()
+    texts = cur.execute("SELECT count(*) FROM message WHERE text_data IS NOT NULL AND text_data != ''").fetchone()[0]
+    cur.execute("BEGIN")
+    try:
+        log("completing and rebuilding the search index (a few minutes, no output - normal)")
+        added = complete_search_index(cur)
+        log("checking the database (a few minutes)")
+        ok = cur.execute("PRAGMA quick_check").fetchone()[0]
+        if ok != "ok":
+            raise RuntimeError(f"database check failed: {ok}")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        con.close()
+        raise
+    con.close()
+    log(f"search index: {texts:,} text messages, {added:,} entries filled in, index rebuilt")
+    out = os.path.join(OUT_DIR, "msgstore.db.crypt15")
+    encrypt_file(db, key, original, out)
+    del key
+    log(f"done: {out} ({gb(os.path.getsize(out))})")
+    if ask_yes("Delete the unlocked (readable) copy of your chats now?"):
+        os.remove(db)
+        log("deleted")
+    print(f"""
+ALL DONE. In {OUT_DIR} you now have:
+  msgstore.db.crypt15        your backup with a complete search index   <- the one to restore
+  current-original.crypt15   the untouched backup                       <- keep it: it's your undo
+
+Next: follow the "Restore on Android" steps in the guide (skip the old-media step).""")
+    if shutil.which("termux-wake-unlock"):
+        subprocess.run(["termux-wake-unlock"], check=False)
+
+
 def parse_args(argv):
     global OLD_BACKUP, CUR_BACKUP, OUT_DIR, WAKIT_ONLY
     p = argparse.ArgumentParser(description="Merge an old phone's WhatsApp backup into the current phone's backup.")
@@ -788,6 +906,8 @@ def parse_args(argv):
     p.add_argument("--work", help="where the unlocked copies are kept")
     p.add_argument("--redo-merge", action="store_true", help="merge again from a new current-phone backup")
     p.add_argument("--wakit-only", action="store_true", help="copy only what wakit 0.3.0 copies")
+    p.add_argument("--fix-search", action="store_true",
+                   help="no merge: make every message in the current backup findable by WhatsApp search")
     a = p.parse_args(argv)
     if a.old:
         OLD_BACKUP = os.path.abspath(os.path.expanduser(a.old))
@@ -803,6 +923,9 @@ def parse_args(argv):
 
 def main(argv=None):
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    if a.fix_search:
+        print("wa_merge --fix-search: make every message findable by WhatsApp search\n")
+        return fix_search()
     if a.redo_merge:
         for f in (MERGED_OK, NEW_DB, NEW_DB + "-journal", NEW_DB + "-wal"):
             if os.path.exists(f):
