@@ -680,13 +680,14 @@ def merge(cur, report):
                   first_ts=first_ts, last_ts=last_ts)
 
 
-def complete_search_index(cur):
-    """Make WhatsApp's search index cover every text message, and rebuild it.
+def complete_search_index(cur, commit_every=None):
+    """Make WhatsApp's search index cover every text message.
 
-    Backups keep the search index's text but not its lookup tables. Adding entries to such a half-empty
-    index made WhatsApp skip its own rebuild after the restore, so messages that were already on the
-    current phone could not be found by search. This adds any missing entries (in the format wakit uses)
-    and rebuilds the whole index from its text."""
+    Backups leave out most of the search index and the app rebuilds it after a restore. Adding the old
+    phone's entries made WhatsApp treat the index as complete, so messages that were already on the current
+    phone could not be found by search. This adds an entry (in the format wakit uses) for every text message
+    that has none, then rebuilds the index only if it is inconsistent. Works in slices of message ids, with
+    progress; with commit_every it also saves after each slice, so a large backup never needs much memory."""
     from wakit import db_merge as W
     from wakit.export_import import has_fts
     if not has_fts(cur):
@@ -699,27 +700,33 @@ def complete_search_index(cur):
         log(f"  WhatsApp's own search entries match the message text exactly: {same:.0%} of {len(sample):,} checked")
         if same < 0.9:
             log("  note: this phone's WhatsApp stores search text differently; filled-in entries use the plain text")
-    missing = [r[0] for r in cur.execute(
-        "SELECT m._id FROM main.message m WHERE m.text_data IS NOT NULL AND m.text_data != '' "
-        "AND NOT EXISTS (SELECT 1 FROM main.message_ftsv2 f WHERE f.docid = m._id)")]
-    added = 0
-    for i in range(0, len(missing), 5000):
-        batch = missing[i:i + 5000]
-        rows = cur.execute(f"SELECT _id, chat_row_id, from_me, sender_jid_row_id, text_data FROM main.message "
-                           f"WHERE _id IN ({','.join('?' * len(batch))})", batch).fetchall()
+    lo, hi = cur.execute("SELECT coalesce(min(_id), 0), coalesce(max(_id), 0) FROM main.message").fetchone()
+    added, step, last_log = 0, 50000, time.time()
+    for a in range(lo, hi + 1, step):
+        rows = cur.execute(
+            "SELECT m._id, m.chat_row_id, m.from_me, m.sender_jid_row_id, m.text_data FROM main.message m "
+            "WHERE m._id >= ? AND m._id < ? AND m.text_data IS NOT NULL AND m.text_data != '' "
+            "AND NOT EXISTS (SELECT 1 FROM main.message_ftsv2 f WHERE f.docid = m._id)", (a, a + step)).fetchall()
         for mid, chat, from_me, sender, text in rows:
-            if chat not in chat_jid or chat_jid[chat] is None:
+            if chat_jid.get(chat) is None:
                 continue
             s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
             cur.execute("INSERT INTO main.message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,'')",
                         (mid, text, f"{s} {W.b36(chat_jid[chat] + 10)}"))
             added += 1
-    cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('rebuild')")
+        if commit_every:
+            commit_every()
+        if time.time() - last_log > 20:
+            log(f"    search entries: {min(100, 100 * (a + step - lo) // max(1, hi - lo + 1))}% through, {added:,} added")
+            last_log = time.time()
+    log(f"    search entries: {added:,} added; checking the index (a few minutes, no output - normal)")
     try:
         cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('integrity-check')")
-    except sqlite3.OperationalError as e:
-        if "integrity-check" not in str(e):   # older SQLite without the command: skip the extra check
-            raise
+    except sqlite3.DatabaseError:           # inconsistent (or an older SQLite without the check): rebuild
+        log("    the index needs rebuilding (a few minutes, no output - normal)")
+        cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('rebuild')")
+        if commit_every:
+            commit_every()
     return added
 
 
@@ -863,23 +870,30 @@ def fix_search():
     doctor.require(c, "android", "the backup")
     c.close()
     con = sqlite3.connect(db, isolation_level=None)
+    con.execute("PRAGMA cache_size=-65536")
     cur = con.cursor()
     texts = cur.execute("SELECT count(*) FROM message WHERE text_data IS NOT NULL AND text_data != ''").fetchone()[0]
+
+    def save():
+        cur.execute("COMMIT")
+        cur.execute("BEGIN")
+
     cur.execute("BEGIN")
     try:
-        log("completing and rebuilding the search index (a few minutes, no output - normal)")
-        added = complete_search_index(cur)
-        log("checking the database (a few minutes)")
+        log(f"completing the search index for {texts:,} text messages (progress every 20 seconds)")
+        added = complete_search_index(cur, commit_every=save)
+        cur.execute("COMMIT")
+        log("checking the database (a few minutes, no output - normal)")
         ok = cur.execute("PRAGMA quick_check").fetchone()[0]
         if ok != "ok":
             raise RuntimeError(f"database check failed: {ok}")
-        con.commit()
     except BaseException:
-        con.rollback()
+        if con.in_transaction:
+            con.rollback()
         con.close()
         raise
     con.close()
-    log(f"search index: {texts:,} text messages, {added:,} entries filled in, index rebuilt")
+    log(f"search index: {texts:,} text messages, {added:,} entries filled in, index checked")
     out = os.path.join(OUT_DIR, "msgstore.db.crypt15")
     encrypt_file(db, key, original, out)
     del key

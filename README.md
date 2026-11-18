@@ -309,7 +309,7 @@ No Termux? Copy the phone's **WA work/WhatsApp/Media** folder to a computer, dro
 
 Merges made with wa_merge.py before 18 November 2026, or with wakit 0.3.0, can leave messages that were on the current phone before the merge out of WhatsApp's search. They're still in your chats; search just can't find them. Messages from the old phone and messages received after the restore are found normally.
 
-Why: WhatsApp backups leave out most of the search index, and WhatsApp rebuilds it after a restore. Adding the old phone's search entries made WhatsApp think the index was already complete, so it never rebuilt the entries for the current phone's own messages. The current version of wa_merge.py fills in every missing entry and rebuilds the index during the merge.
+Why: WhatsApp backups leave out most of the search index, and WhatsApp rebuilds it after a restore. Adding the old phone's search entries made WhatsApp think the index was already complete, so it never rebuilt the entries for the current phone's own messages. The current version of wa_merge.py fills in every missing entry during the merge, and rebuilds the index only if it needs it.
 
 To fix a phone that's already merged (about 1 hour, no merging again):
 
@@ -328,7 +328,7 @@ curl -LO https://raw.githubusercontent.com/Mousawi45/whatsapp-merge/main/wa_merg
 python wa_merge.py --fix-search
 ```
 
-   Type **yes** when it asks whether the backup is fresh, and paste **this phone's** key. It only adds the missing search entries and rebuilds the index; nothing else in the backup changes. The result is **WA work/msgstore.db.crypt15**, with **current-original.crypt15** as your undo.
+   Type **yes** when it asks whether the backup is fresh, and paste **this phone's** key. It only adds the missing search entries (and rebuilds the index if it needs it); nothing else in the backup changes. It shows progress every 20 seconds and saves as it goes. Keep Termux on screen with the phone charging, and set Termux's battery to **Unrestricted** (long-press the Termux icon → App info → Battery), or Android may close it partway through. If it closes anyway, just run the same command again. The result is **WA work/msgstore.db.crypt15**, with **current-original.crypt15** as your undo.
 4. Follow [Restore on Android](#restore-on-android-methods-a-b-and-c), but **skip step 3** (the media is already in place).
 
 ## Cleanup afterwards
@@ -360,5 +360,6 @@ Use WhatsApp normally for 2–3 days first. WhatsApp makes its own backup each n
 
 ## Changes
 
+- **18 November 2026 (later):** the search fix uses much less memory: it works in slices, shows progress every 20 seconds, saves as it goes, and rebuilds the index only if it's inconsistent. On some phones the earlier version froze and Android closed Termux during this step.
 - **18 November 2026:** the merge now completes and rebuilds WhatsApp's search index, so messages that were on the current phone before the merge can be found with search. Added `--fix-search` for phones merged with an earlier version.
 - **17 November 2026:** first version.
