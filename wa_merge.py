@@ -1171,7 +1171,7 @@ def check_search(words):
         by_sort = _sort_lookup(c.cursor(), "main")
         print("\n== 2. your words (WhatsApp links entries to messages by sort id) ==")
         hits = q("SELECT _id, sort_id, chat_row_id, timestamp, message_type, from_me, sender_jid_row_id, text_data "
-                 "FROM message WHERE instr(text_data, ?) > 0 ORDER BY _id LIMIT 8", words)
+                 "FROM message WHERE instr(lower(text_data), lower(?)) > 0 ORDER BY _id LIMIT 8", words)
         print(f"  messages containing them: {len(hits)}{' (first 8)' if len(hits) == 8 else ''}")
         tokens = [w.replace('"', "") for w in words.split() if w.replace('"', "")]
         match = " ".join(f'"{w}"' for w in tokens)
@@ -1192,7 +1192,7 @@ def check_search(words):
             if not m:
                 print(f"  entry {d:,} -> NO message with that id")
                 continue
-            ok = words in (m[4] or "")
+            ok = words.lower() in (m[4] or "").lower()
             print(f"  entry {d:,} -> message {m[0]:,}: {when(m[2])}, {label(m[1])}, {TYPE_NAMES.get(m[3], f'type {m[3]}')}, "
                   f"has your words: {'yes' if ok else 'NO'}")
 
