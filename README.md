@@ -307,11 +307,11 @@ No Termux? Copy the phone's **WA work/WhatsApp/Media** folder to a computer, dro
 
 ## Fix search after an earlier merge
 
-Merges made with wa_merge.py before 18 November 2026, or with wakit 0.3.0, can leave messages that were on the current phone before the merge out of WhatsApp's search. They're still in your chats; search just can't find them. Messages from the old phone and messages received after the restore are found normally.
+Merges made with wa_merge.py before the evening of 18 November 2026, or with wakit 0.3.0, leave WhatsApp's search showing the wrong messages: searching a word lists messages that don't contain it, and misses ones that do. Your chats themselves are fine; only the search index is mixed up. Messages received after the restore are found normally.
 
-Why: WhatsApp backups leave out most of the search index, and WhatsApp rebuilds it after a restore. Adding the old phone's search entries made WhatsApp think the index was already complete, so it never rebuilt the entries for the current phone's own messages. The current version of wa_merge.py fills in every missing entry during the merge, and rebuilds the index only if it needs it.
+Why: WhatsApp links each search entry to a message by the message's *sort id* (its place in the chat), not by its row id. On a phone that was never merged the two are almost always the same number. A merge renumbers the sort ids so the old history comes first, and the earlier versions kept the search entries keyed by row id, so WhatsApp looked up the wrong messages. The current version checks which message each entry belongs to (by its words) and writes the index keyed by sort id, the way WhatsApp does.
 
-To fix a phone that's already merged (about 1 hour, no merging again):
+To fix a phone that's already merged (about 1 hour including the restore, no merging again):
 
 1. In Termux, get the current version of the script:
 
@@ -328,7 +328,7 @@ curl -LO https://raw.githubusercontent.com/Mousawi45/whatsapp-merge/main/wa_merg
 python wa_merge.py --fix-search
 ```
 
-   Type **yes** when it asks whether the backup is fresh, and paste **this phone's** key. It only adds the missing search entries (and rebuilds the index if it needs it); nothing else in the backup changes. It shows progress every 20 seconds and saves as it goes. Keep Termux on screen with the phone charging, and set Termux's battery to **Unrestricted** (long-press the Termux icon → App info → Battery), or Android may close it partway through. If it closes anyway, just run the same command again. The result is **WA work/msgstore.db.crypt15**, with **current-original.crypt15** as your undo.
+   Type **yes** when it asks whether the backup is fresh, and paste **this phone's** key. It only rewrites the search index (linked by sort id, with an entry for every text message); nothing else in the backup changes. It takes about 10–20 minutes on a large backup. It shows progress every 20 seconds and saves as it goes. Keep Termux on screen with the phone charging, and set Termux's battery to **Unrestricted** (long-press the Termux icon → App info → Battery), or Android may close it partway through. If it closes anyway, just run the same command again. The result is **WA work/msgstore.db.crypt15**, with **current-original.crypt15** as your undo.
 4. Follow [Restore on Android](#restore-on-android-methods-a-b-and-c), but **skip step 3** (the media is already in place).
 
 If search still misses a message after that, run `python wa_merge.py --check-search` and paste a few words from the message. It changes nothing and prints no message text, only what the search index holds for those words (dates, chat names and counts), so you can share the output when asking for help.
@@ -362,6 +362,7 @@ Use WhatsApp normally for 2–3 days first. WhatsApp makes its own backup each n
 
 ## Changes
 
+- **18 November 2026 (late night):** found the real search bug: WhatsApp links search entries to messages by sort id, and the merge renumbers sort ids. The merge and `--fix-search` now write the index keyed by sort id, checking that each entry's words match its message. `--check-search` shows what search would return either way.
 - **18 November 2026 (night):** added `--check-search`, a read-only check of why search can't find a message.
 - **18 November 2026 (evening):** writing the new backup no longer loads the whole original backup into memory. With large backups (over about 0.5 GB) Android closed Termux right after "index checked" (the merge was affected too). `--fix-search` also shows which months the filled-in entries are from.
 - **18 November 2026 (later):** the search fix uses much less memory: it works in slices, shows progress every 20 seconds, saves as it goes, and rebuilds the index only if it's inconsistent. On some phones the earlier version froze and Android closed Termux during this step.

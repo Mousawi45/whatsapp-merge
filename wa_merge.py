@@ -574,6 +574,10 @@ def merge(cur, report):
     del old_chats
     log(f"  {len(maps['C']):,} old chats matched or created")
 
+    if has_fts(cur):
+        log("  reading this phone's search entries (before its messages are renumbered)")
+        k, d = stage_search_entries(cur, "main")
+        log(f"    {k:,} entries kept, {d:,} that matched no message dropped")
     log("step 2/7: messages")
     msg_cols = [c for c in W.cols(cur, "message", "o") if c in set(W.cols(cur, "message")) and c != "_id"]
     i_chat, i_from, i_key = msg_cols.index("chat_row_id"), msg_cols.index("from_me"), msg_cols.index("key_id")
@@ -620,26 +624,11 @@ def merge(cur, report):
             log(f"  {table}: {n:,}")
 
     log("step 4/7: search index")
-    chat_jid = dict(cur.execute("SELECT _id, jid_row_id FROM chat"))
-    fts = 0
-    if has_fts(cur) and has_fts(cur, "o"):
-        for docid, content, ns in _stream(cur, "SELECT docid, content, fts_namespace FROM o.message_ftsv2"):
-            nid = maps["M"].get(docid)
-            info = inserted.get(nid)
-            if info is None:
-                continue
-            chat, from_me, sender, _ = info
-            s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
-            cur.execute("INSERT INTO message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,?)",
-                        (nid, content, f"{s} {W.b36(chat_jid[chat] + 10)}", ns or ""))
-            fts += 1
-            if fts % 200000 == 0:
-                log(f"  search index: {fts:,}")
-    report["rows"]["message_ftsv2"] = fts
-    log("  completing the search index (a few minutes, no output - normal)")
-    added = complete_search_index(cur)
-    if added:
-        report["rows"]["search entries filled in"] = added
+    if has_fts(cur):
+        if has_fts(cur, "o"):
+            log("  reading the old phone's search entries")
+            k, d = stage_search_entries(cur, "o", to_merged=maps["M"].get, retag=True)
+            report["rows"]["message_ftsv2"] = k
 
     n = copy_rows(cur, "call_log", {"_id": "L*", "jid_row_id": "J", "group_jid_row_id": "J",
                                      "call_creator_device_jid_row_id": "R"}, maps, jids, or_ignore=True)
@@ -678,6 +667,11 @@ def merge(cur, report):
     for cid in created - touched:
         cur.execute("DELETE FROM chat WHERE _id=?", (cid,))
     cur.execute("DROP INDEX IF EXISTS main.wa_merge_tmp_chat_ts")
+    if has_fts(cur):    # after the renumbering: WhatsApp links entries by sort id
+        log("  writing the search index, linked by sort id like WhatsApp does")
+        fresh = write_search_index(cur)
+        if fresh:
+            report["rows"]["search entries filled in"] = fresh
     jm, names = jids.finish()
     report.update(created=len(created & touched), merged={c: merged[c] for c in merged if c in touched},
                   unhidden=sum(1 for c in hidden_new if c in touched), messages=n_inserted, dupes=dupes,
@@ -685,66 +679,226 @@ def merge(cur, report):
                   first_ts=first_ts, last_ts=last_ts)
 
 
-def complete_search_index(cur, commit_every=None):
-    """Make WhatsApp's search index cover every text message.
+# WhatsApp links each search entry to a message by the message's SORT id (its place in the chat), not by its
+# row id. On a phone that was never merged the two are almost always equal, so this only shows after a merge:
+# the merge renumbers sort ids to put the old history first, and an index keyed by row id then points
+# WhatsApp at unrelated messages. These functions work out which message each entry belongs to (the
+# entry's text decides) and write the index keyed by sort id.
 
-    Backups leave out most of the search index and the app rebuilds it after a restore. Adding the old
-    phone's entries made WhatsApp treat the index as complete, so messages that were already on the current
-    phone could not be found by search. This adds an entry (in the format wakit uses) for every text message
-    that has none, then rebuilds the index only if it is inconsistent. Works in slices of message ids, with
-    progress; with commit_every it also saves after each slice, so a large backup never needs much memory."""
-    from wakit import db_merge as W
-    from wakit.export_import import has_fts
-    if not has_fts(cur):
-        return 0
-    chat_jid = dict(cur.execute("SELECT _id, jid_row_id FROM main.chat"))
-    sample = cur.execute("SELECT f.content, m.text_data FROM main.message_ftsv2 f JOIN main.message m ON m._id = f.docid "
-                         "WHERE m.text_data != '' LIMIT 2000").fetchall()
-    if sample:
-        same = sum(a == b for a, b in sample) / len(sample)
-        log(f"  WhatsApp's own search entries match the message text exactly: {same:.0%} of {len(sample):,} checked")
-        if same < 0.9:
-            log("  note: this phone's WhatsApp stores search text differently; filled-in entries use the plain text")
-    lo, hi = cur.execute("SELECT coalesce(min(_id), 0), coalesce(max(_id), 0) FROM main.message").fetchone()
-    has_ts = "timestamp" in [r[1] for r in cur.execute("PRAGMA main.table_info(message)")]
-    months = {}
-    added, step, last_log = 0, 50000, time.time()
+_AR = str.maketrans({"\u0629": "\u0647", "\u0623": "\u0627", "\u0625": "\u0627", "\u0622": "\u0627",
+                     "\u0671": "\u0627", "\u0649": "\u064a", "\u0626": "\u064a", "\ufe0f": " ", "\u0640": ""})
+_DIACRITICS = re.compile("[\u064b-\u065f\u0670\u06d6-\u06ed]")
+_WORD = re.compile(r"\w+")
+MISSING = object()
+
+
+def _plain(text):
+    return _DIACRITICS.sub("", (text or "").translate(_AR))
+
+
+def wa_entry_text(text):
+    """Close to how WhatsApp writes an entry: Arabic letter forms unified, diacritics dropped,
+    emoji and symbols split off so the words around them can be found."""
+    t = re.sub(r"([^\w\s])", r" \1 ", _plain(text))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _words(text):
+    return set(_WORD.findall(_plain(text).lower()))
+
+
+def _same_message(content, text):
+    """Does this entry's text belong to this message? WhatsApp's entry text is a normalised copy of the
+    message (plus the preview text for links), so nearly all of the message's words must be in the entry,
+    and most of the entry's words in the message. A doubtful entry is dropped and the message gets a fresh
+    entry from its own text, so being strict here costs nothing."""
+    c, t = _words(content), _words(text)
+    if not c or not t:
+        return not c and not t
+    both = len(c & t)
+    has_link = "http" in text or "www." in text
+    return both >= 0.8 * len(t) and (has_link or both >= 0.6 * len(c))
+
+
+def _sort_lookup(cur, schema):
+    """sort id -> message row id, in two compact arrays (about 70 MB for 4 million messages)."""
+    from array import array
+    sids, mids = array("q"), array("q")
+    for sid, mid in cur.execute(f"SELECT sort_id, _id FROM {schema}.message WHERE sort_id IS NOT NULL ORDER BY sort_id"):
+        sids.append(sid)
+        mids.append(mid)
+
+    def get(sid):
+        import bisect
+        k = bisect.bisect_left(sids, sid)
+        return mids[k] if k < len(sids) and sids[k] == sid else None
+    return get
+
+
+def _fts_rows(cur, schema, lo, hi):
+    try:
+        return cur.execute(f"SELECT docid, c0content, c1fts_jid, c2fts_namespace FROM {schema}.message_ftsv2_content "
+                           "WHERE docid >= ? AND docid < ?", (lo, hi)).fetchall()
+    except sqlite3.OperationalError:
+        return cur.execute(f"SELECT docid, content, fts_jid, fts_namespace FROM {schema}.message_ftsv2 "
+                           "WHERE docid >= ? AND docid < ?", (lo, hi)).fetchall()
+
+
+def stage_search_entries(cur, schema="main", to_merged=None, retag=False, commit_every=None):
+    """Read schema's search entries, work out which message each one belongs to, and keep them in
+    temp.wa_fts_stage keyed by the (merged) message row id. Entries whose text matches neither the message
+    with that row id nor the one with that sort id are dropped; the message then gets a fresh entry later.
+    -> (kept, dropped)"""
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS wa_fts_stage(mid INTEGER PRIMARY KEY, content TEXT, jid TEXT, ns TEXT)")
+    try:
+        lo, hi = cur.execute(f"SELECT min(docid), max(docid) FROM {schema}.message_ftsv2_content").fetchone()
+    except sqlite3.OperationalError:
+        lo, hi = cur.execute(f"SELECT min(docid), max(docid) FROM {schema}.message_ftsv2").fetchone()
+    if lo is None:
+        return 0, 0
+    by_sort = _sort_lookup(cur, schema)
+
+    def text_of(mid):
+        r = cur.execute(f"SELECT text_data FROM {schema}.message WHERE _id = ?", (mid,)).fetchone()
+        return MISSING if r is None else (r[0] or "")
+
+    # which way are this database's entries linked? (decides entries on messages without text, e.g. documents)
+    by_id = by_sort_n = 0
+    for k in range(400):
+        d = lo + (hi - lo) * k // 400
+        r = _fts_rows(cur, schema, d, d + 1000)[:1]
+        if not r:
+            continue
+        docid, content = r[0][0], r[0][1]
+        ta, b = text_of(docid), by_sort(docid)
+        tb = text_of(b) if b is not None else MISSING
+        by_id += ta is not MISSING and bool(ta) and _same_message(content, ta)
+        by_sort_n += tb is not MISSING and bool(tb) and _same_message(content, tb)
+    default = "id" if by_id > by_sort_n else "sort"
+    log(f"    entries here are linked by {'row id' if default == 'id' else 'sort id'} "
+        f"(sample: {by_id} by row id, {by_sort_n} by sort id)")
+
+    kept = dropped = 0
+    step, last_log = 50000, time.time()
     for a in range(lo, hi + 1, step):
-        rows = cur.execute(
-            "SELECT m._id, m.chat_row_id, m.from_me, m.sender_jid_row_id, m.text_data, "
-            + ("m.timestamp" if has_ts else "0") + " FROM main.message m "
-            "WHERE m._id >= ? AND m._id < ? AND m.text_data IS NOT NULL AND m.text_data != '' "
-            "AND NOT EXISTS (SELECT 1 FROM main.message_ftsv2 f WHERE f.docid = m._id)", (a, a + step)).fetchall()
-        for mid, chat, from_me, sender, text, ts in rows:
-            if chat_jid.get(chat) is None:
+        ents = _fts_rows(cur, schema, a, a + step)
+        if not ents:
+            continue
+        texts = {m: (t or "") for m, t in cur.execute(f"SELECT _id, text_data FROM {schema}.message "
+                                                      "WHERE _id >= ? AND _id < ?", (a, a + step))}
+        rows = []
+        for docid, content, tag, ns in ents:
+            ta = texts.get(docid, MISSING)
+            mid = None
+            if ta is not MISSING and ta and _same_message(content, ta):
+                mid = docid
+            else:
+                b = by_sort(docid)
+                tb = text_of(b) if b is not None else MISSING
+                if tb is not MISSING and tb and _same_message(content, tb):
+                    mid = b
+                elif default == "id" and ta is not MISSING and not ta:
+                    mid = docid          # a message without text (a document's name, a contact card, ...)
+                elif default == "sort" and tb is not MISSING and not tb:
+                    mid = b
+            if mid is not None and to_merged is not None:
+                mid = to_merged(mid)
+            if mid is None:
+                dropped += 1
                 continue
-            if ts:
-                try:
-                    mon = time.strftime("%Y-%m", time.gmtime(ts / 1000))
-                    months[mon] = months.get(mon, 0) + 1
-                except (OverflowError, OSError, ValueError):
-                    pass
-            s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
-            cur.execute("INSERT INTO main.message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,'')",
-                        (mid, text, f"{s} {W.b36(chat_jid[chat] + 10)}"))
-            added += 1
+            rows.append((mid, content, None if retag else tag, ns or ""))
+        cur.executemany("INSERT OR IGNORE INTO temp.wa_fts_stage VALUES(?,?,?,?)", rows)
+        kept += len(rows)
         if commit_every:
             commit_every()
         if time.time() - last_log > 20:
-            log(f"    search entries: {min(100, 100 * (a + step - lo) // max(1, hi - lo + 1))}% through, {added:,} added")
+            log(f"    reading search entries: {min(100, 100 * (a + step - lo) // max(1, hi - lo + 1))}%")
             last_log = time.time()
-    if months:
-        top = sorted(months.items(), key=lambda kv: -kv[1])[:6]
-        log("    filled in, by month: " + ", ".join(f"{m} {n:,}" for m, n in sorted(top)))
-    log(f"    search entries: {added:,} added; checking the index (a few minutes, no output - normal)")
+    return kept, dropped
+
+
+def write_search_index(cur, commit_every=None):
+    """Replace WhatsApp's search index with the staged entries, keyed by sort id, plus a fresh entry for every
+    text message that has none. -> number of fresh entries"""
+    from wakit import db_merge as W
+    sql = cur.execute("SELECT sql FROM main.sqlite_master WHERE type='table' AND name='message_ftsv2'").fetchone()[0]
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS wa_fts_stage(mid INTEGER PRIMARY KEY, content TEXT, jid TEXT, ns TEXT)")
+    cur.execute("DROP TABLE main.message_ftsv2")
+    cur.execute(sql)
+    other = {}
+    try:
+        for lid, pn in cur.execute("SELECT lid_row_id, jid_row_id FROM main.jid_map"):
+            other[lid], other[pn] = pn, lid
+    except sqlite3.Error:
+        pass
+    chat_jid = dict(cur.execute("SELECT _id, jid_row_id FROM main.chat"))
+
+    def tag(from_me, sender, chat):   # the format WhatsApp itself uses
+        cj = chat_jid.get(chat)
+        if cj is None:
+            return None
+        s = "1" if from_me else (W.b36(other.get(sender, sender) + 10) if (sender or 0) > 0 else "0")
+        return f"{s} {W.b36(cj + 10)}"
+
+    ins = "INSERT INTO main.message_ftsv2(docid, content, fts_jid, fts_namespace) VALUES(?,?,?,?)"
+    lo, hi = cur.execute("SELECT coalesce(min(_id), 0), coalesce(max(_id), 0) FROM main.message").fetchone()
+    written = fresh = clashes = 0
+    step, last_log = 50000, time.time()
+    for a in range(lo, hi + 1, step):
+        rows = []
+        for mid, sid, chat, from_me, sender, text, content, jid, ns, staged in cur.execute(
+                "SELECT m._id, m.sort_id, m.chat_row_id, m.from_me, m.sender_jid_row_id, m.text_data, "
+                "s.content, s.jid, s.ns, s.mid IS NOT NULL FROM main.message m LEFT JOIN temp.wa_fts_stage s ON s.mid = m._id "
+                "WHERE m._id >= ? AND m._id < ?", (a, a + step)).fetchall():
+            if sid is None:
+                continue
+            if staged:
+                t = jid or tag(from_me, sender, chat)
+                if t is not None:
+                    rows.append((sid, content, t, ns or ""))
+            elif text:
+                t = tag(from_me, sender, chat)
+                if t is not None:
+                    rows.append((sid, wa_entry_text(text), t, ""))
+                    fresh += 1
+        try:
+            cur.executemany(ins, rows)
+        except sqlite3.IntegrityError:          # two messages with the same sort id: keep the first
+            for r in rows:
+                try:
+                    cur.execute(ins, r)
+                except sqlite3.IntegrityError:
+                    clashes += 1
+        written += len(rows)
+        if commit_every:
+            commit_every()
+        if time.time() - last_log > 20:
+            log(f"    writing the search index: {min(100, 100 * (a + step - lo) // max(1, hi - lo + 1))}%, {written:,} entries")
+            last_log = time.time()
+    cur.execute("DROP TABLE temp.wa_fts_stage")
+    log(f"    search index: {written - clashes:,} entries ({fresh:,} new)" + (f", {clashes} sort-id clashes" if clashes else "")
+        + "; checking it (a few minutes, no output - normal)")
     try:
         cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('integrity-check')")
-    except sqlite3.DatabaseError:           # inconsistent (or an older SQLite without the check): rebuild
+    except sqlite3.DatabaseError:
         log("    the index needs rebuilding (a few minutes, no output - normal)")
         cur.execute("INSERT INTO main.message_ftsv2(message_ftsv2) VALUES('rebuild')")
         if commit_every:
             commit_every()
-    return added
+    return fresh
+
+
+def rebuild_search_index(cur, commit_every=None):
+    """--fix-search: relink every entry in this database to its message by sort id."""
+    from wakit.export_import import has_fts
+    if not has_fts(cur):
+        return 0, 0, 0
+    log("  reading the search entries and checking which message each belongs to")
+    kept, dropped = stage_search_entries(cur, "main", commit_every=commit_every)
+    log(f"    {kept:,} entries kept, {dropped:,} that matched no message dropped")
+    log("  writing the search index, linked by sort id")
+    fresh = write_search_index(cur, commit_every=commit_every)
+    return kept, dropped, fresh
 
 
 def run_merge(old_path, new_path):
@@ -755,6 +909,7 @@ def run_merge(old_path, new_path):
         c.close()
     con = sqlite3.connect("file:" + urllib.parse.quote(new_path) + "?mode=rw", uri=True, isolation_level=None)
     con.execute("PRAGMA cache_size=-262144")
+    con.execute("PRAGMA temp_store=FILE")
     con.execute("ATTACH ? AS o", ("file:" + urllib.parse.quote(old_path) + "?mode=ro",))
     cur = con.cursor()
     report = {"rows": {}}
@@ -888,6 +1043,7 @@ def fix_search():
     c.close()
     con = sqlite3.connect(db, isolation_level=None)
     con.execute("PRAGMA cache_size=-65536")
+    con.execute("PRAGMA temp_store=FILE")
     cur = con.cursor()
     texts = cur.execute("SELECT count(*) FROM message WHERE text_data IS NOT NULL AND text_data != ''").fetchone()[0]
 
@@ -897,8 +1053,8 @@ def fix_search():
 
     cur.execute("BEGIN")
     try:
-        log(f"completing the search index for {texts:,} text messages (progress every 20 seconds)")
-        added = complete_search_index(cur, commit_every=save)
+        log(f"relinking the search index for {texts:,} text messages (progress every 20 seconds)")
+        kept, dropped, added = rebuild_search_index(cur, commit_every=save)
         cur.execute("COMMIT")
         log("checking the database (a few minutes, no output - normal)")
         ok = cur.execute("PRAGMA quick_check").fetchone()[0]
@@ -910,7 +1066,7 @@ def fix_search():
         con.close()
         raise
     con.close()
-    log(f"search index: {texts:,} text messages, {added:,} entries filled in, index checked")
+    log(f"search index: {kept:,} entries relinked, {added:,} new, {dropped:,} wrong ones dropped")
     out = os.path.join(OUT_DIR, "msgstore.db.crypt15")
     encrypt_file(db, key, original, out)
     del key
@@ -989,7 +1145,7 @@ def check_search(words):
         slo, shi = one("SELECT coalesce(min(sort_id), 0), coalesce(max(sort_id), 0) FROM message")
         print(f"  message ids {lo:,}-{hi:,}, sort ids {slo:,}-{shi:,}")
         try:
-            bad = one("SELECT count(*), sum(m._id IS NULL) FROM message_ftsv2_content f LEFT JOIN message m ON m._id = f.docid "
+            bad = one("SELECT count(*), sum(m._id IS NULL) FROM message_ftsv2_content f LEFT JOIN message m ON m.sort_id = f.docid "
                       "WHERE m._id IS NULL OR coalesce(m.text_data, '') = ''")
             print(f"  entries pointing at a message with no text: {bad[0]:,} (at no message at all: {bad[1] or 0:,})")
         except sqlite3.Error:
@@ -1012,36 +1168,33 @@ def check_search(words):
             s = "1" if from_me else (W.b36(sender + 10) if (sender or 0) > 0 else "0")
             return f"{s} {W.b36(cj[0] + 10)}"
 
-        print("\n== 2. your words ==")
+        by_sort = _sort_lookup(c.cursor(), "main")
+        print("\n== 2. your words (WhatsApp links entries to messages by sort id) ==")
         hits = q("SELECT _id, sort_id, chat_row_id, timestamp, message_type, from_me, sender_jid_row_id, text_data "
                  "FROM message WHERE instr(text_data, ?) > 0 ORDER BY _id LIMIT 8", words)
         print(f"  messages containing them: {len(hits)}{' (first 8)' if len(hits) == 8 else ''}")
         tokens = [w.replace('"', "") for w in words.split() if w.replace('"', "")]
         match = " ".join(f'"{w}"' for w in tokens)
         for mid, sid, chat, ts, mtype, from_me, sender, text in hits:
-            e = one("SELECT content, fts_jid, fts_namespace FROM message_ftsv2 WHERE docid = ?", mid)
+            e = one("SELECT content, fts_jid, fts_namespace FROM message_ftsv2 WHERE docid = ?", sid)
             print(f"  message {mid:,} (sort {sid:,}), {when(ts)}, {label(chat)}, {'sent' if from_me else 'received'}")
             if not e:
                 print("    search entry: NONE")
                 continue
-            found = one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ? AND docid = ?", match, mid)[0]
+            found = one("SELECT count(*) FROM message_ftsv2 WHERE message_ftsv2 MATCH ? AND docid = ?", match, sid)[0]
             print(f"    search entry: yes; same text: {'yes' if e[0] == text else 'no'}; "
                   f"contact/chat tag ok: {'yes' if e[1] == expected_jid(chat, from_me, sender) else 'NO'} "
                   f"({re.sub(r'[0-9a-z]', 'x', str(e[1]))}); namespace {e[2]!r}; found by search: {'yes' if found else 'NO'}")
         docs = [r[0] for r in q("SELECT docid FROM message_ftsv2 WHERE message_ftsv2 MATCH ? LIMIT 8", match)]
         print(f"  the search index finds: {len(docs)} entr{'y' if len(docs) == 1 else 'ies'}")
         for d in docs:
-            m = one("SELECT _id, chat_row_id, timestamp, message_type, text_data FROM message WHERE _id = ?", d)
+            m = one("SELECT _id, chat_row_id, timestamp, message_type, text_data FROM message WHERE _id = ?", by_sort(d) or -1)
             if not m:
                 print(f"  entry {d:,} -> NO message with that id")
                 continue
             ok = words in (m[4] or "")
             print(f"  entry {d:,} -> message {m[0]:,}: {when(m[2])}, {label(m[1])}, {TYPE_NAMES.get(m[3], f'type {m[3]}')}, "
                   f"has your words: {'yes' if ok else 'NO'}")
-            if not ok:
-                m2 = one("SELECT _id, chat_row_id, timestamp FROM message WHERE sort_id = ? AND instr(text_data, ?) > 0", d, words)
-                if m2:
-                    print(f"    (the message with sort id {d:,} has your words: message {m2[0]:,}, {when(m2[2])})")
 
         print("\n== 2b. what search would show (newest first), depending on how WhatsApp links entries to messages ==")
         clean = [re.sub(r'["*():^]', "", w) for w in words.split()]
@@ -1067,16 +1220,19 @@ def check_search(words):
         except sqlite3.Error:
             pass
         chats = {r[0]: r[1] for r in q("SELECT _id, jid_row_id FROM chat")}
-        for group, sql in (("newest entries", "SELECT docid, c1fts_jid FROM message_ftsv2_content ORDER BY docid DESC LIMIT 300"),
-                           ("entries made on this phone before the merge",
-                            "SELECT docid, c1fts_jid FROM message_ftsv2_content WHERE docid < ? ORDER BY docid DESC LIMIT 300")):
+        for group in ("newest entries", "entries from across the history"):
             try:
-                rows = q(sql) if "?" not in sql else q(sql, one("SELECT max(_id) FROM message WHERE _id < sort_id")[0] + 1)
+                if group == "newest entries":
+                    rows = q("SELECT docid, c1fts_jid FROM message_ftsv2_content ORDER BY docid DESC LIMIT 300")
+                else:
+                    flo, fhi = one("SELECT min(docid), max(docid) FROM message_ftsv2_content")
+                    rows = [r for k in range(300) for r in q("SELECT docid, c1fts_jid FROM message_ftsv2_content "
+                                                             "WHERE docid >= ? LIMIT 1", flo + (fhi - flo) * k // 300)]
             except (sqlite3.Error, TypeError):
                 rows = []
             tally, n = {}, 0
             for docid, tag in rows:
-                m = one("SELECT from_me, sender_jid_row_id, chat_row_id FROM message WHERE _id = ?", docid)
+                m = one("SELECT from_me, sender_jid_row_id, chat_row_id FROM message WHERE _id = ?", by_sort(docid) or -1)
                 if not m or not tag:
                     continue
                 n += 1
@@ -1113,7 +1269,7 @@ def check_search(words):
         stats, samples = {}, {}
         step = 50000
         for a in range(lo, hi + 1, step):
-            for mid, ts, has in q("SELECT m._id, m.timestamp, EXISTS(SELECT 1 FROM message_ftsv2 f WHERE f.docid = m._id) "
+            for mid, ts, has in q("SELECT m._id, m.timestamp, EXISTS(SELECT 1 FROM message_ftsv2 f WHERE f.docid = m.sort_id) "
                                   "FROM message m WHERE m._id >= ? AND m._id < ? AND coalesce(m.text_data, '') != ''",
                                   a, a + step):
                 mon = time.strftime("%Y-%m", time.localtime(ts / 1000)) if ts and ts > 0 else "no date"
@@ -1133,7 +1289,7 @@ def check_search(words):
             n, missing = stats[mon]
             same = sim = unrel = 0
             for mid in samples.get(mon, []):
-                text, content = one("SELECT m.text_data, f.content FROM message m JOIN message_ftsv2 f ON f.docid = m._id "
+                text, content = one("SELECT m.text_data, f.content FROM message m JOIN message_ftsv2 f ON f.docid = m.sort_id "
                                     "WHERE m._id = ?", mid)
                 text, content = text or "", content or ""
                 if text == content:
