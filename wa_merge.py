@@ -849,15 +849,15 @@ def fix_search():
     if not ask_yes("Is this backup fresh and is the phone offline?"):
         stop("turn on airplane mode, make a fresh backup (WhatsApp > Settings > Chats > Chat backup > Back up), "
              "and run this again")
+    db = os.path.join(WORK, "fix.db")
+    for f in (db, db + "-journal", db + "-wal"):     # leftovers from a run that was closed partway
+        if os.path.exists(f):
+            os.remove(f)
     if free_bytes(WORK) < 3.5 * os.path.getsize(src) + 2e9:
         stop("not enough free space for this backup")
     shutil.copy2(src, original + ".part")
     os.replace(original + ".part", original)
     log(f"kept an untouched copy of the current phone's backup: {original}")
-    db = os.path.join(WORK, "fix.db")
-    for f in (db, db + "-journal", db + "-wal"):
-        if os.path.exists(f):
-            os.remove(f)
     while True:
         key = ask_key("CURRENT phone's 64-digit key")
         try:
